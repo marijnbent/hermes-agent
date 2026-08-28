@@ -34,6 +34,14 @@ import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
 import {
+  captureInboxBatch,
+  createInboxArchive,
+  inboxSocketConfig,
+  pairOnlyExitDelayMs,
+  removePairingQr,
+  writePairingQr,
+} from './inbox_archive.js';
+import {
   buildPollPayload,
   createReconnectScheduler,
   createVersionResolver,
@@ -95,6 +103,17 @@ const DOCUMENT_CACHE_DIR = process.env.HERMES_DOCUMENT_CACHE_DIR
   || path.join(process.env.HOME || '~', '.hermes', 'document_cache');
 const AUDIO_CACHE_DIR = process.env.HERMES_AUDIO_CACHE_DIR
   || path.join(process.env.HOME || '~', '.hermes', 'audio_cache');
+const INBOX_CAPTURE_ENABLED =
+  typeof process.env.WHATSAPP_INBOX_CAPTURE_ENABLED === 'string'
+  && ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_INBOX_CAPTURE_ENABLED.toLowerCase());
+const INBOX_CAPTURE_DIR = process.env.WHATSAPP_INBOX_CAPTURE_DIR
+  || path.join(SESSION_DIR, '..', 'inbox');
+const INBOX_CAPTURE_SINCE = process.env.WHATSAPP_INBOX_CAPTURE_SINCE || '1970-01-01T00:00:00Z';
+const inboxArchive = INBOX_CAPTURE_ENABLED
+  ? createInboxArchive({ rootDir: INBOX_CAPTURE_DIR, since: INBOX_CAPTURE_SINCE })
+  : null;
+const inboxChatNames = new Map();
+const inboxContactNames = new Map();
 
 // Self-hash of this script file.  Reported in /health so the Python gateway
 // can detect a running bridge that predates the current bridge.js and
@@ -407,8 +426,7 @@ async function startSocket() {
     auth: state,
     logger,
     printQRInTerminal: false,
-    browser: ['Hermes Agent', 'Chrome', '120.0'],
-    syncFullHistory: false,
+    ...inboxSocketConfig(INBOX_CAPTURE_ENABLED),
     markOnlineOnConnect: false,
     // Required for Baileys 7.x: without this, incoming messages that need
     // E2EE session re-establishment are silently dropped (msg.message === null)
@@ -421,10 +439,61 @@ async function startSocket() {
 
   sock.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); });
 
+  const downloadInboxMedia = async (mediaMsg) => downloadMediaMessage(
+    mediaMsg,
+    'buffer',
+    {},
+    { logger, reuploadRequest: sock.updateMediaMessage },
+  );
+
+  if (inboxArchive) {
+    sock.ev.on('contacts.upsert', (contacts) => {
+      for (const contact of contacts || []) {
+        const name = contact.name || contact.notify || contact.verifiedName;
+        if (contact.id && name) inboxContactNames.set(contact.id, name);
+      }
+    });
+    sock.ev.on('contacts.update', (contacts) => {
+      for (const contact of contacts || []) {
+        const name = contact.name || contact.notify || contact.verifiedName;
+        if (contact.id && name) inboxContactNames.set(contact.id, name);
+      }
+    });
+    sock.ev.on('chats.upsert', (chats) => {
+      for (const chat of chats || []) {
+        const name = chat.name || chat.displayName;
+        if (chat.id && name) inboxChatNames.set(chat.id, name);
+      }
+    });
+    sock.ev.on('chats.update', (chats) => {
+      for (const chat of chats || []) {
+        const name = chat.name || chat.displayName;
+        if (chat.id && name) inboxChatNames.set(chat.id, name);
+      }
+    });
+    sock.ev.on('messaging-history.set', async ({ chats, contacts, messages }) => {
+      for (const chat of chats || []) {
+        const name = chat.name || chat.displayName;
+        if (chat.id && name) inboxChatNames.set(chat.id, name);
+      }
+      for (const contact of contacts || []) {
+        const name = contact.name || contact.notify || contact.verifiedName;
+        if (contact.id && name) inboxContactNames.set(contact.id, name);
+      }
+      await captureInboxBatch(inboxArchive, messages, {
+        source: 'history',
+        chatNames: inboxChatNames,
+        contactNames: inboxContactNames,
+        downloadMedia: downloadInboxMedia,
+      });
+    });
+  }
+
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
+      if (PAIR_ONLY) writePairingQr(SESSION_DIR, qr);
       if (PAIR_JSON) {
         emitPairEvent({ event: 'qr', qr });
       } else {
@@ -457,6 +526,7 @@ async function startSocket() {
         scheduleReconnect(reason === 515 ? 1000 : 3000);
       }
     } else if (connection === 'open') {
+      if (PAIR_ONLY) removePairingQr(SESSION_DIR);
       connectionState = 'connected';
       const connectedUser = sock?.user
         ? {
@@ -472,8 +542,9 @@ async function startSocket() {
         if (!PAIR_JSON) {
           console.log('✅ Pairing complete. Credentials saved.');
         }
-        // Give Baileys a moment to flush creds, then exit cleanly
-        setTimeout(() => process.exit(0), 2000);
+        // Passive inbox pairing stays alive for the initial history sync.
+        // Normal pairing preserves the old quick credential-flush exit.
+        setTimeout(() => process.exit(0), pairOnlyExitDelayMs(INBOX_CAPTURE_ENABLED));
       }
     }
   });
@@ -533,6 +604,15 @@ async function startSocket() {
     // In self-chat mode, your own messages commonly arrive as 'append' rather
     // than 'notify'. Accept both and filter agent echo-backs below.
     if (type !== 'notify' && type !== 'append') return;
+
+    if (inboxArchive) {
+      await captureInboxBatch(inboxArchive, messages, {
+        source: 'live',
+        chatNames: inboxChatNames,
+        contactNames: inboxContactNames,
+        downloadMedia: downloadInboxMedia,
+      });
+    }
 
     const botIds = Array.from(new Set([
       normalizeWhatsAppId(sock.user?.id),
@@ -1111,6 +1191,9 @@ app.get('/health', (req, res) => {
     uptime: process.uptime(),
     scriptHash: SCRIPT_HASH,
     sendReadReceipts: SEND_READ_RECEIPTS,
+    inboxCaptureEnabled: INBOX_CAPTURE_ENABLED,
+    inboxCaptureSince: INBOX_CAPTURE_SINCE,
+    inboxCaptureDir: INBOX_CAPTURE_DIR,
   });
 });
 

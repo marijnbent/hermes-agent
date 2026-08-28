@@ -3667,6 +3667,8 @@ def cmd_whatsapp(args):
     print()
 
     try:
+        from hermes_cli.whatsapp_pairing import pairing_bridge_env
+
         subprocess.run(
             [
                 find_node_executable("node") or "node",
@@ -3676,7 +3678,7 @@ def cmd_whatsapp(args):
                 str(session_dir),
             ],
             cwd=str(bridge_dir),
-            env=with_hermes_node_path(),
+            env=pairing_bridge_env(),
         )
     except KeyboardInterrupt:
         pass
@@ -3710,6 +3712,13 @@ def cmd_whatsapp(args):
         print("  Or install as a service: hermes gateway install")
     else:
         print("⚠ Pairing may not have completed. Run 'hermes whatsapp' to try again.")
+
+
+def cmd_whatsapp_inbox(args):
+    """Query the passive WhatsApp inbox archive."""
+    from plugins.platforms.whatsapp.inbox_cli import whatsapp_inbox_command
+
+    return whatsapp_inbox_command(args)
 
 
 def cmd_whatsapp_cloud(args):
@@ -13474,7 +13483,11 @@ def main():
     # =========================================================================
     # whatsapp command  (parser built in hermes_cli/subcommands/whatsapp.py)
     # =========================================================================
-    build_whatsapp_parser(subparsers, cmd_whatsapp=cmd_whatsapp)
+    build_whatsapp_parser(
+        subparsers,
+        cmd_whatsapp=cmd_whatsapp,
+        cmd_whatsapp_inbox=cmd_whatsapp_inbox,
+    )
 
     # =========================================================================
     # whatsapp-cloud command (official Meta Cloud API; complement to Baileys)

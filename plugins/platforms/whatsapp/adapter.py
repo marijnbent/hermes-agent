@@ -455,6 +455,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             read_receipts if isinstance(read_receipts, bool)
             else str(read_receipts or "").strip().lower() in {"1", "true", "yes", "on"}
         )
+        self._inbox_capture_enabled = _wenv(
+            "WHATSAPP_INBOX_CAPTURE_ENABLED", "false"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._inbox_capture_since = _wenv(
+            "WHATSAPP_INBOX_CAPTURE_SINCE", "1970-01-01T00:00:00Z"
+        )
         self._mention_patterns = self._compile_mention_patterns()
         self._message_queue: asyncio.Queue = asyncio.Queue()
         self._bridge_log_fh = None
@@ -648,7 +654,15 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 running_hash = data.get("scriptHash", "")
                                 disk_hash = _file_content_hash(bridge_path)
                                 running_read_receipts = bool(data.get("sendReadReceipts", False))
-                                config_matches = running_read_receipts == self._send_read_receipts
+                                config_matches = (
+                                    running_read_receipts == self._send_read_receipts
+                                    and bool(data.get("inboxCaptureEnabled", False))
+                                    == self._inbox_capture_enabled
+                                    and str(data.get("inboxCaptureSince") or "")
+                                    == self._inbox_capture_since
+                                    and str(data.get("inboxCaptureDir") or "")
+                                    == str(self._session_path.parent / "inbox")
+                                )
                                 if (
                                     running_hash
                                     and disk_hash
@@ -666,7 +680,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 stale_reason = (
                                     f"running={running_hash or 'unversioned'}, disk={disk_hash}"
                                     if running_hash != disk_hash
-                                    else "send_read_receipts config changed"
+                                    else "bridge configuration changed"
                                 )
                                 print(f"[{self.name}] Running bridge is stale ({stale_reason}), restarting")
                             else:
@@ -717,10 +731,14 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 "WHATSAPP_DEBUG", "WHATSAPP_FORWARD_OWNER_MESSAGES",
                 "WHATSAPP_REPLY_PREFIX", "WHATSAPP_MAX_MESSAGE_LENGTH",
                 "WHATSAPP_CHUNK_DELAY_MS", "WHATSAPP_SEND_TIMEOUT_MS",
+                "WHATSAPP_INBOX_CAPTURE_ENABLED", "WHATSAPP_INBOX_CAPTURE_SINCE",
             ):
                 _v = _wenv(_key)
                 if _v:
                     bridge_env[_key] = _v
+            bridge_env["WHATSAPP_INBOX_CAPTURE_DIR"] = str(
+                self._session_path.parent / "inbox"
+            )
             # Pass the profile-aware cache directories so the bridge writes
             # media where the Python side reads it.  Without these the bridge
             # hardcodes ~/.hermes/{image,audio,document}_cache, which diverges
@@ -1878,6 +1896,14 @@ def _apply_yaml_config(yaml_cfg: dict, whatsapp_cfg: dict) -> dict | None:
         if isinstance(gaf, list):
             gaf = ",".join(str(v) for v in gaf)
         os.environ["WHATSAPP_GROUP_ALLOWED_USERS"] = str(gaf)
+    inbox_capture = whatsapp_cfg.get("inbox_capture")
+    if isinstance(inbox_capture, dict):
+        if "enabled" in inbox_capture and not os.getenv("WHATSAPP_INBOX_CAPTURE_ENABLED"):
+            os.environ["WHATSAPP_INBOX_CAPTURE_ENABLED"] = str(
+                inbox_capture["enabled"]
+            ).lower()
+        if "since" in inbox_capture and not os.getenv("WHATSAPP_INBOX_CAPTURE_SINCE"):
+            os.environ["WHATSAPP_INBOX_CAPTURE_SINCE"] = str(inbox_capture["since"])
     return None
 
 
