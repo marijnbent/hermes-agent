@@ -14,6 +14,7 @@ import { getAggregateVotesInPollMessage } from '@whiskeysockets/baileys';
 
 import {
   buildPollPayload,
+  buildReactionPayload,
   buildTextSendPayload,
   createBoundedMessageStore,
   appendMediaFailureNote,
@@ -23,6 +24,27 @@ import {
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
 } from './bridge_helpers.js';
+
+// -- outbound reactions ---------------------------------------------------
+{
+  const payload = buildReactionPayload({
+    chatId: '31681053848@s.whatsapp.net',
+    messageId: 'outbound-robot-test',
+    emoji: '🤖',
+  });
+
+  assert.deepEqual(payload, {
+    react: {
+      text: '🤖',
+      key: {
+        id: 'outbound-robot-test',
+        remoteJid: '31681053848@s.whatsapp.net',
+        fromMe: true,
+      },
+    },
+  });
+  console.log('  ✓ outbound reactions target the linked account’s own message');
+}
 
 // -- inbound read receipts ------------------------------------------------
 {

@@ -65,6 +65,19 @@ export function createBoundedMessageStore(limit = 512) {
   return { remember, get };
 }
 
+export function buildReactionPayload({ chatId, messageId, emoji }) {
+  return {
+    react: {
+      text: emoji,
+      key: {
+        id: messageId,
+        remoteJid: chatId,
+        fromMe: true,
+      },
+    },
+  };
+}
+
 export function pollCreationMessageSecret(pollCreation) {
   return pollCreation?.message?.messageContextInfo?.messageSecret
     || pollCreation?.messageContextInfo?.messageSecret

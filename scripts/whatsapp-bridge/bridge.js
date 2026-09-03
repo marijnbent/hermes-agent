@@ -8,6 +8,7 @@
  * Endpoints (matches gateway/platforms/whatsapp.py expectations):
  *   GET  /messages       - Long-poll for new incoming messages
  *   POST /send           - Send a message { chatId, message, replyTo? }
+ *   POST /react          - React to a sent message { chatId, messageId, emoji }
  *   POST /edit           - Edit a sent message { chatId, messageId, message }
  *   POST /send-media     - Send media natively { chatId, filePath, mediaType?, caption?, fileName? }
  *   POST /send-location  - Send location pin { chatId, latitude, longitude, name?, address? }
@@ -43,6 +44,7 @@ import {
 } from './inbox_archive.js';
 import {
   buildPollPayload,
+  buildReactionPayload,
   createReconnectScheduler,
   createVersionResolver,
   buildLocationPayload,
@@ -935,6 +937,25 @@ app.post('/send', async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// React to a message sent by the linked account.
+app.post('/react', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+
+  const { chatId, messageId, emoji } = req.body;
+  if (!chatId || !messageId || typeof emoji !== 'string') {
+    return res.status(400).json({ error: 'chatId, messageId, and emoji are required' });
+  }
+
+  try {
+    await sendWithTimeout(chatId, buildReactionPayload({ chatId, messageId, emoji }));
+    return res.json({ success: true, messageId, emoji });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
   }
 });
 
