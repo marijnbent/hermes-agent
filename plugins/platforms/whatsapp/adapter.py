@@ -3,6 +3,7 @@ client; messages are polled over a local HTTP API and responses are posted back 
 
 import asyncio
 import logging
+import mimetypes
 import os
 import platform
 import re
@@ -13,7 +14,9 @@ from functools import wraps
 from pathlib import Path
 from typing import Dict, Optional, Any
 
-from gateway.platforms._shared import get_scoped_secret
+from gateway.platforms._shared import (
+    apply_yaml_bridge as _apply_yaml_bridge, extra_or_secret as _extra_or_secret, get_scoped_secret, send_error
+)
 from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
 from hermes_constants import (find_node_executable, get_hermes_dir, with_hermes_node_path)
 
@@ -175,6 +178,7 @@ from gateway.whatsapp_identity import to_whatsapp_jid
 from gateway.platforms.base import (
     BasePlatformAdapter, SendResult, SUPPORTED_DOCUMENT_TYPES, cache_image_from_url, cache_audio_from_url,
 )
+from gateway.platforms.helpers import cancel_task
 from gateway.platforms.event import MessageEvent, MessageType
 from utils import env_int
 
@@ -234,6 +238,11 @@ _MEDIA_INFO = {
     MessageType.PHOTO: ("image", "image/jpeg"), MessageType.VOICE: ("audio", "audio/ogg"), MessageType.AUDIO: ("audio", "audio/mpeg"),
     MessageType.VIDEO: ("video", "video/mp4"), MessageType.DOCUMENT: ("document", ""),
 }
+_MEDIA_TYPE_BY_BRIDGE_KIND = {"image": MessageType.PHOTO, "video": MessageType.VIDEO, "audio": MessageType.VOICE, "document": MessageType.DOCUMENT}
+_QUOTED_MIME_BY_BRIDGE_KIND = {
+    "image": "image/jpeg", "video": "video/mp4", "gif": "video/mp4", "audio": "audio/ogg", "ptt": "audio/ogg",
+    "document": "application/octet-stream", "sticker": "image/webp",
+}
 
 
 def _needs_bridge(method):
@@ -259,51 +268,18 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             WhatsAppAdapter._DEFAULT_BRIDGE_DIR = resolve_whatsapp_bridge_dir()
         extra = config.extra
         self._bridge_process: Optional[subprocess.Popen] = None
-
-        self._bridge_port: int = config.extra.get("bridge_port", 3000)
-        self._bridge_script: Optional[str] = config.extra.get(
-            "bridge_script",
-            str(self._DEFAULT_BRIDGE_DIR / "bridge.js"),
-        )
-        self._session_path: Path = Path(config.extra.get(
-            "session_path",
-            get_hermes_dir("platforms/whatsapp/session", "whatsapp/session")
-        ))
-        self._reply_prefix: Optional[str] = config.extra.get("reply_prefix")
-        self._dm_policy = str(config.extra.get("dm_policy") or _wenv("WHATSAPP_DM_POLICY", "pairing")).strip().lower()
-        # Prefer config.extra, then the documented WHATSAPP_ALLOWED_USERS env
-        # (setup wizard / pairing mirror). Select by key *presence* so an
-        # explicit empty allow_from: [] stays authoritative and does not fall
-        # through to a lower-precedence env grant. Track which source won so
-        # live DM checks preserve that precedence. Env reads go through the
-        # profile secret scope (_wenv) so multiplexed profiles see their own.
-        if "allow_from" in config.extra:
-            self._dm_allowlist_source = "config"
-            allow_raw = config.extra.get("allow_from")
-        elif "allowFrom" in config.extra:
-            self._dm_allowlist_source = "config"
-            allow_raw = config.extra.get("allowFrom")
-        elif _wenv("WHATSAPP_ALLOWED_USERS"):
-            self._dm_allowlist_source = "WHATSAPP_ALLOWED_USERS"
-            allow_raw = _wenv("WHATSAPP_ALLOWED_USERS")
-        else:
-            self._dm_allowlist_source = None
-            allow_raw = None
-        self._allow_from = self._coerce_allow_list(allow_raw)
-        self._group_policy = str(config.extra.get("group_policy") or _wenv("WHATSAPP_GROUP_POLICY", "pairing")).strip().lower()
-        self._group_allow_from = self._coerce_allow_list(config.extra.get("group_allow_from") or config.extra.get("groupAllowFrom"))
-        read_receipts = config.extra.get("send_read_receipts", False)
-        self._send_read_receipts = (
-            read_receipts if isinstance(read_receipts, bool)
-            else str(read_receipts or "").strip().lower() in {"1", "true", "yes", "on"}
-        )
-        self._inbox_capture_enabled = _wenv(
-            "WHATSAPP_INBOX_CAPTURE_ENABLED", "false"
-        ).strip().lower() in {"1", "true", "yes", "on"}
-        self._inbox_capture_since = _wenv(
-            "WHATSAPP_INBOX_CAPTURE_SINCE", "1970-01-01T00:00:00Z"
-        )
-
+        self._bridge_port: int = extra.get("bridge_port", 3000)
+        self._bridge_script: str = extra.get("bridge_script", str(self._DEFAULT_BRIDGE_DIR / "bridge.js"))
+        self._session_path = Path(extra.get("session_path", get_hermes_dir("platforms/whatsapp/session", "whatsapp/session")))
+        self._reply_prefix: Optional[str] = extra.get("reply_prefix")
+        self._dm_policy = str(_extra_or_secret(extra, "dm_policy", "WHATSAPP_DM_POLICY", "pairing")).strip().lower()
+        self._allow_from = self._coerce_allow_list(self._select_dm_allowlist(extra, ("WHATSAPP_ALLOWED_USERS",), _wenv))
+        self._group_policy = str(_extra_or_secret(extra, "group_policy", "WHATSAPP_GROUP_POLICY", "pairing")).strip().lower()
+        self._group_allow_from = self._coerce_allow_list(extra.get("group_allow_from") or extra.get("groupAllowFrom"))
+        rr = extra.get("send_read_receipts", False)
+        self._send_read_receipts = rr if isinstance(rr, bool) else str(rr or "").strip().lower() in {"1", "true", "yes", "on"}
+        self._inbox_capture_enabled = str(_extra_or_secret(extra, "inbox_capture_enabled", "WHATSAPP_INBOX_CAPTURE_ENABLED", "false")).strip().lower() in {"1", "true", "yes", "on"}
+        self._inbox_capture_since = str(_extra_or_secret(extra, "inbox_capture_since", "WHATSAPP_INBOX_CAPTURE_SINCE", "1970-01-01T00:00:00Z"))
         self._mention_patterns = self._compile_mention_patterns()
         self._message_queue: asyncio.Queue = asyncio.Queue()
         self._bridge_log_fh = self._bridge_log = self._poll_task = self._http_session = None
@@ -312,8 +288,6 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # Text debounce batching: rapid bursts (forwards, paste-splits) would otherwise each trigger a separate agent turn.
         self._text_batch_delay_seconds = self._coerce_float_extra("text_batch_delay_seconds", 5.0)
         self._text_batch_split_delay_seconds = self._coerce_float_extra("text_batch_split_delay_seconds", 10.0)
-        self._pending_text_batches: Dict[str, MessageEvent] = {}
-        self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
 
     def _coerce_float_extra(self, key: str, default: float) -> float:
         """Read a float from ``config.extra``; NaN/Inf/negative/unparseable → ``default`` (fed to asyncio.sleep)."""
@@ -390,7 +364,13 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 print(f"[{self.name}] Bridge found but not connected (status: {bridge_status}), restarting")
                 return False
             running_hash, disk_hash = data.get("scriptHash", ""), _file_content_hash(bridge_path)
-            if running_hash and disk_hash and running_hash == disk_hash and bool(data.get("sendReadReceipts", False)) == self._send_read_receipts:
+            config_matches = (
+                bool(data.get("sendReadReceipts", False)) == self._send_read_receipts
+                and bool(data.get("inboxCaptureEnabled", False)) == getattr(self, "_inbox_capture_enabled", False)
+                and str(data.get("inboxCaptureSince") or "") == getattr(self, "_inbox_capture_since", "1970-01-01T00:00:00Z")
+                and str(data.get("inboxCaptureDir") or "") == str(self._session_path.parent / "inbox")
+            )
+            if running_hash and disk_hash and running_hash == disk_hash and config_matches:
                 print(f"[{self.name}] Using existing bridge (status: {bridge_status})")
                 self._mark_connected()
                 self._attach_to_bridge(None)  # Not managed by us
@@ -403,15 +383,31 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         return False
 
     def _bridge_env(self) -> dict:
-        """Subprocess env: profile-resolved WHATSAPP_* values + profile-aware cache dirs."""
-        # with_hermes_node_path() copies os.environ when called with no arg.
+        """Subprocess env: the adapter's EFFECTIVE profile policy + profile-resolved WHATSAPP_* values + cache dirs."""
+        # with_hermes_node_path() copies os.environ when called with no arg: under a multiplexed secondary
+        # that copy carries the DEFAULT profile's WHATSAPP_* values, so every bridge-consumed key is
+        # re-resolved from this profile (dropped on a scoped miss), never inherited from the launch env.
         bridge_env = with_hermes_node_path()
         if self._reply_prefix is not None:
             bridge_env["WHATSAPP_REPLY_PREFIX"] = self._reply_prefix
         bridge_env["WHATSAPP_SEND_READ_RECEIPTS"] = "true" if self._send_read_receipts else "false"
+        bridge_env["WHATSAPP_INBOX_CAPTURE_ENABLED"] = "true" if getattr(self, "_inbox_capture_enabled", False) else "false"
+        bridge_env["WHATSAPP_INBOX_CAPTURE_SINCE"] = getattr(self, "_inbox_capture_since", "1970-01-01T00:00:00Z")
+        bridge_env["WHATSAPP_INBOX_CAPTURE_DIR"] = str(self._session_path.parent / "inbox")
         for _key, _v in [("WHATSAPP_MODE", _wenv("WHATSAPP_MODE", "self-chat"))] + [(k, _wenv(k)) for k in _BRIDGE_PASSTHROUGH_ENV]:
             if _v:
                 bridge_env[_key] = _v
+            else:
+                bridge_env.pop(_key, None)
+        # bridge.js gates DMs BEFORE Python sees them: it must run the same dm_policy / allow_from the
+        # adapter resolved (scoped env → this profile's YAML → default), or a secondary's YAML
+        # ``dm_policy: pairing`` runs under the default profile's allowlist and drops valid pairing DMs.
+        bridge_env["WHATSAPP_DM_POLICY"] = self._dm_policy
+        allowed = ",".join(sorted(self._allow_from))
+        if allowed:
+            bridge_env["WHATSAPP_ALLOWED_USERS"] = allowed
+        else:
+            bridge_env.pop("WHATSAPP_ALLOWED_USERS", None)
         # Without these the bridge hardcodes ~/.hermes/{image,audio,document}_cache (wrong under HERMES_HOME/profiles/cache layout).
         img_dir, audio_dir, _video_dir, doc_dir = _cache_dirs()
         bridge_env.update(HERMES_IMAGE_CACHE_DIR=str(img_dir), HERMES_AUDIO_CACHE_DIR=str(audio_dir), HERMES_DOCUMENT_CACHE_DIR=str(doc_dir))
@@ -499,68 +495,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             if not self._ensure_bridge_deps(bridge_path.parent):
                 return False
             self._session_path.mkdir(parents=True, exist_ok=True)
-
-            
-            # Check if bridge is already running and connected
-            import aiohttp
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(
-                        f"http://127.0.0.1:{self._bridge_port}/health",
-                        timeout=aiohttp.ClientTimeout(total=2)
-                    ) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            bridge_status = data.get("status", "unknown")
-                            if bridge_status == "connected":
-                                # Staleness handshake: only reuse a running
-                                # bridge if it is serving the same bridge.js
-                                # that is on disk right now.  A long-lived
-                                # bridge survives gateway restarts AND
-                                # `hermes update`, so without this check it
-                                # keeps serving pre-update code forever
-                                # (e.g. no inbound media download).  Old
-                                # bridges that don't report scriptHash are
-                                # treated as stale by definition.
-                                running_hash = data.get("scriptHash", "")
-                                disk_hash = _file_content_hash(bridge_path)
-                                running_read_receipts = bool(data.get("sendReadReceipts", False))
-                                config_matches = (
-                                    running_read_receipts == self._send_read_receipts
-                                    and bool(data.get("inboxCaptureEnabled", False))
-                                    == self._inbox_capture_enabled
-                                    and str(data.get("inboxCaptureSince") or "")
-                                    == self._inbox_capture_since
-                                    and str(data.get("inboxCaptureDir") or "")
-                                    == str(self._session_path.parent / "inbox")
-                                )
-                                if (
-                                    running_hash
-                                    and disk_hash
-                                    and running_hash == disk_hash
-                                    and config_matches
-                                ):
-                                    print(f"[{self.name}] Using existing bridge (status: {bridge_status})")
-                                    self._mark_connected()
-                                    self._bridge_process = None  # Not managed by us
-                                    self._http_session = aiohttp.ClientSession()
-                                    self._poll_task = asyncio.create_task(self._poll_messages())
-                                    # Plugin-registered native handlers.
-                                    self._wire_plugin_handlers(None)
-                                    return True
-                                stale_reason = (
-                                    f"running={running_hash or 'unversioned'}, disk={disk_hash}"
-                                    if running_hash != disk_hash
-                                    else "bridge configuration changed"
-                                )
-                                print(f"[{self.name}] Running bridge is stale ({stale_reason}), restarting")
-                            else:
-                                print(f"[{self.name}] Bridge found but not connected (status: {bridge_status}), restarting")
-            except Exception:
-                pass  # Bridge not running, start a new one
-            
-            # Kill any orphaned bridge from a previous gateway run
-
+            if await self._reuse_running_bridge(bridge_path):
+                return True
             _kill_stale_bridge_by_pidfile(self._session_path)
             _kill_port_process(self._bridge_port)
             await asyncio.sleep(1)
@@ -631,10 +567,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             except Exception as e:
                 print(f"[{self.name}] Error stopping bridge: {e}")
         _unlink_quietly(self._session_path / "bridge.pid")
-        if self._poll_task and not self._poll_task.done():
-            self._poll_task.cancel()
-            with suppress(asyncio.CancelledError, Exception):
-                await self._poll_task
+        await cancel_task(self._poll_task)
         if self._http_session and not self._http_session.closed:
             await self._http_session.close()
         self._poll_task = self._http_session = self._bridge_process = None
@@ -696,9 +629,17 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     async def _send_media_to_bridge(self, chat_id: str, file_path: str, media_type: str, caption: Optional[str] = None, file_name: Optional[str] = None) -> SendResult:
         if not os.path.exists(file_path):
             return SendResult(success=False, error=f"File not found: {file_path}")
-        payload: Dict[str, Any] = {"chatId": to_whatsapp_jid(chat_id), "filePath": file_path, "mediaType": media_type}
+        jid = to_whatsapp_jid(chat_id)
+        payload: Dict[str, Any] = {"chatId": jid, "filePath": file_path, "mediaType": media_type}
         payload.update({k: v for k, v in (("caption", caption), ("fileName", file_name)) if v})
-        return await self._post_bridge_message("send-media", payload, timeout=120)
+        result = await self._post_bridge_message("send-media", payload, timeout=120)
+        if result.success and result.message_id:
+            # A later quote of this attachment carries only a thumbnail stub; the bridge's cache
+            # knows inbound media only, so index our own sends (the cron-delivered image case).
+            from gateway import rich_sent_store
+            mime = mimetypes.guess_type(file_path)[0] or _MEDIA_INFO.get(_MEDIA_TYPE_BY_BRIDGE_KIND.get(media_type), ("", ""))[1]
+            rich_sent_store.record_media(jid, result.message_id, [(file_path, mime or "application/octet-stream")])
+        return result
 
     @_needs_bridge
     async def send_poll(self, chat_id: str, question: str, options: list[str], *, selectable_count: int = 1) -> SendResult:
@@ -815,19 +756,6 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
     _SPLIT_THRESHOLD = 6000  # WhatsApp supports ~65K chars; generous threshold
 
-    async def _flush_text_batch(self, key: str) -> None:
-        current_task = asyncio.current_task()
-        try:
-            pending = self._pending_text_batches.get(key)
-            last_len = getattr(pending, "_last_chunk_len", 0) if pending else 0
-            await asyncio.sleep(self._text_batch_split_delay_seconds if last_len >= self._SPLIT_THRESHOLD else self._text_batch_delay_seconds)
-            event = self._pending_text_batches.pop(key, None)
-            if event:
-                await self.handle_message(event)
-        finally:
-            if self._pending_text_batch_tasks.get(key) is current_task:
-                self._pending_text_batch_tasks.pop(key, None)
-
     @staticmethod
     def _classify_bridge_message(data: Dict[str, Any]) -> MessageType:
         media_type = str(data.get("mediaType", "") or "")
@@ -882,6 +810,27 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 print(f"[{self.name}] Failed to read document text: {e}", flush=True)
         return body
 
+    def _quoted_media(self, data: Dict[str, Any], raw_reply_id: Any) -> list[tuple[str, str]]:
+        """``(path, mime)`` for the quoted message's attachment, folded into this event's own media so the
+        vision/audio pipeline sees it like a direct send. ``contextInfo.quotedMessage`` carries only a
+        thumbnail stub, so the bridge resolves INBOUND quotes from its download cache (``quotedMediaUrls``,
+        guarded like direct media: a rogue bridge could hand back /etc/passwd); quotes of OUR media (cron
+        chart, generated image — any path we chose) resolve from the outbound index written by
+        ``_send_media_to_bridge``."""
+        quoted_type = str(data.get("quotedMediaType") or "").strip()
+        accepted: list[tuple[str, str]] = []
+        for path in data.get("quotedMediaUrls") or []:
+            if not (isinstance(path, str) and os.path.isabs(path) and _is_allowed_bridge_path(path)):
+                print(f"[{self.name}] Rejected quoted-media path outside cache dir: {path}", flush=True)
+                continue
+            accepted.append((path, _QUOTED_MIME_BY_BRIDGE_KIND.get(quoted_type, "application/octet-stream")))
+        if not accepted and raw_reply_id is not None:
+            from gateway import rich_sent_store
+            accepted = rich_sent_store.lookup_media(data.get("chatId", ""), str(raw_reply_id))
+        for path, _ in accepted:
+            print(f"[{self.name}] Attached quoted-reply media: {path}", flush=True)
+        return accepted
+
     async def _build_message_event(self, data: Dict[str, Any]) -> Optional[MessageEvent]:
         """Build a MessageEvent from bridge message data, downloading images to cache."""
         try:
@@ -889,7 +838,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 return None
             msg_type = self._classify_bridge_message(data)
             source = self.build_source(chat_id=data.get("chatId", ""), chat_name=data.get("chatName"), chat_type="group" if data.get("isGroup", False) else "dm",
-                                       user_id=data.get("senderId"), user_name=data.get("senderName"))
+                                       user_id=data.get("senderId"), user_name=data.get("senderName"),
+                                       message_id=data.get("messageId"))
             cached_urls, media_types = await self._collect_bridge_media(data, msg_type)
             body = data.get("body", "")
             if data.get("isGroup"):
@@ -899,6 +849,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             # Quoted message stays in structured fields only — GatewayRunner renders the "[Replying to: ...]" pointer.
             quoted = bool(data.get("hasQuotedMessage"))
             raw_reply_id = data.get("quotedMessageId") if quoted else None
+            if quoted:
+                for path, mime in self._quoted_media(data, raw_reply_id):
+                    cached_urls.append(path)
+                    media_types.append(mime)
             if msg_type == MessageType.DOCUMENT and cached_urls:
                 body = self._inject_document_text(cached_urls, body)
             native_metadata = data.get("nativeMetadata")
@@ -944,7 +898,7 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
     try:
         import aiohttp
     except ImportError:
-        return {"error": "aiohttp not installed. Run: pip install aiohttp"}
+        return send_error("aiohttp not installed. Run: pip install aiohttp")
     try:
         bridge_port = (getattr(pconfig, "extra", {}) or {}).get("bridge_port", 3000)
         normalized_chat_id = to_whatsapp_jid(chat_id)
@@ -959,7 +913,7 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
                 async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=total)) as resp:
                     if resp.status == 200:
                         return (await resp.json()).get("messageId"), None
-                    return None, {} if error_label is None else {"error": f"WhatsApp {error_label} error ({resp.status}): {await resp.text()}"}
+                    return None, {} if error_label is None else send_error(f"WhatsApp {error_label} error ({resp.status}): {await resp.text()}")
             # 1) Text first (skipped when media-only or when the text rides as the caption).
             if (message or "").strip() and not media_caption:
                 last_message_id, err = await _post("send", {"chatId": normalized_chat_id, "message": message}, 30, "bridge")
@@ -974,7 +928,7 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
                             await _post("send", {"chatId": normalized_chat_id, "message": media_caption}, 30)
                         except Exception:
                             logger.warning("WhatsApp caption-fallback send failed for missing media")
-                    return {"error": f"WhatsApp media file not found: {media_path}"}
+                    return send_error(f"WhatsApp media file not found: {media_path}")
                 media_type = _bridge_media_type(media_path, is_voice, force_document)
                 payload: Dict[str, Any] = {"chatId": normalized_chat_id, "filePath": media_path, "mediaType": media_type}
                 payload.update({k: v for k, v in (("fileName", os.path.basename(media_path) if media_type == "document" else None), ("caption", media_caption)) if v})
@@ -984,7 +938,7 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
                 last_message_id = mid or last_message_id
         return {"success": True, "platform": "whatsapp", "chat_id": normalized_chat_id, "message_id": last_message_id}
     except Exception as e:
-        return {"error": f"WhatsApp send failed: {e}"}
+        return send_error(f"WhatsApp send failed: {e}")
 
 
 def interactive_setup() -> None:
@@ -1016,57 +970,25 @@ def interactive_setup() -> None:
 
 
 # config.yaml whatsapp: key → env var. Env vars take precedence over YAML.
-_YAML_LOWERCASE_KEYS = (("require_mention", "WHATSAPP_REQUIRE_MENTION"), ("dm_policy", "WHATSAPP_DM_POLICY"), ("group_policy", "WHATSAPP_GROUP_POLICY"))
-_YAML_LIST_KEYS = (("free_response_chats", "WHATSAPP_FREE_RESPONSE_CHATS"), ("allow_from", "WHATSAPP_ALLOWED_USERS"), ("group_allow_from", "WHATSAPP_GROUP_ALLOWED_USERS"))
+_YAML_BRIDGE = (  # (yaml key, env var, kind) for apply_yaml_bridge
+    ("require_mention", "WHATSAPP_REQUIRE_MENTION", "lower"), ("dm_policy", "WHATSAPP_DM_POLICY", "lower"),
+    ("group_policy", "WHATSAPP_GROUP_POLICY", "lower"), ("mention_patterns", "WHATSAPP_MENTION_PATTERNS", "json"),
+    ("free_response_chats", "WHATSAPP_FREE_RESPONSE_CHATS", "csv"), ("allow_from", "WHATSAPP_ALLOWED_USERS", "csv"),
+    ("group_allow_from", "WHATSAPP_GROUP_ALLOWED_USERS", "csv"),
+)
 
 
 def _apply_yaml_config(yaml_cfg: dict, whatsapp_cfg: dict) -> dict | None:
-    """config.yaml whatsapp: keys → WHATSAPP_* env vars (apply_yaml_config_fn contract; returns None).
-
-    Mirrors the legacy whatsapp_cfg block from gateway/config.py::load_gateway_config(). Env vars take
-    precedence over YAML. Returns None — everything flows through env. See #24849.
-    """
-    import json as _json
-    for key, env in _YAML_LOWERCASE_KEYS:
-        if key in whatsapp_cfg and not os.getenv(env):
-            os.environ[env] = str(whatsapp_cfg[key]).lower()
-    if "mention_patterns" in whatsapp_cfg and not os.getenv("WHATSAPP_MENTION_PATTERNS"):
-        os.environ["WHATSAPP_MENTION_PATTERNS"] = _json.dumps(whatsapp_cfg["mention_patterns"])
-
-    for key, env in _YAML_LIST_KEYS:
-        val = whatsapp_cfg.get(key)
-        if val is not None and not os.getenv(env):
-            os.environ[env] = ",".join(str(v) for v in val) if isinstance(val, list) else str(val)
-
-    frc = whatsapp_cfg.get("free_response_chats")
-    if frc is not None and not os.getenv("WHATSAPP_FREE_RESPONSE_CHATS"):
-        if isinstance(frc, list):
-            frc = ",".join(str(v) for v in frc)
-        os.environ["WHATSAPP_FREE_RESPONSE_CHATS"] = str(frc)
-    if "dm_policy" in whatsapp_cfg and not os.getenv("WHATSAPP_DM_POLICY"):
-        os.environ["WHATSAPP_DM_POLICY"] = str(whatsapp_cfg["dm_policy"]).lower()
-    af = whatsapp_cfg.get("allow_from")
-    if af is not None and not os.getenv("WHATSAPP_ALLOWED_USERS"):
-        if isinstance(af, list):
-            af = ",".join(str(v) for v in af)
-        os.environ["WHATSAPP_ALLOWED_USERS"] = str(af)
-    if "group_policy" in whatsapp_cfg and not os.getenv("WHATSAPP_GROUP_POLICY"):
-        os.environ["WHATSAPP_GROUP_POLICY"] = str(whatsapp_cfg["group_policy"]).lower()
-    gaf = whatsapp_cfg.get("group_allow_from")
-    if gaf is not None and not os.getenv("WHATSAPP_GROUP_ALLOWED_USERS"):
-        if isinstance(gaf, list):
-            gaf = ",".join(str(v) for v in gaf)
-        os.environ["WHATSAPP_GROUP_ALLOWED_USERS"] = str(gaf)
-    inbox_capture = whatsapp_cfg.get("inbox_capture")
-    if isinstance(inbox_capture, dict):
-        if "enabled" in inbox_capture and not os.getenv("WHATSAPP_INBOX_CAPTURE_ENABLED"):
-            os.environ["WHATSAPP_INBOX_CAPTURE_ENABLED"] = str(
-                inbox_capture["enabled"]
-            ).lower()
-        if "since" in inbox_capture and not os.getenv("WHATSAPP_INBOX_CAPTURE_SINCE"):
-            os.environ["WHATSAPP_INBOX_CAPTURE_SINCE"] = str(inbox_capture["since"])
-
-    return None
+    """Bridge nested WhatsApp config through the shared profile-scoped YAML helper."""
+    nested = whatsapp_cfg.get("inbox_capture")
+    if isinstance(nested, dict):
+        whatsapp_cfg = dict(whatsapp_cfg)
+        if "enabled" in nested:
+            whatsapp_cfg["inbox_capture_enabled"] = nested["enabled"]
+        if "since" in nested:
+            whatsapp_cfg["inbox_capture_since"] = nested["since"]
+    spec = _YAML_BRIDGE + (("inbox_capture_enabled", "WHATSAPP_INBOX_CAPTURE_ENABLED", "lower"), ("inbox_capture_since", "WHATSAPP_INBOX_CAPTURE_SINCE", "str"))
+    return _apply_yaml_bridge(whatsapp_cfg, spec)
 
 
 def _is_connected(config) -> bool:
@@ -1078,13 +1000,10 @@ def _is_connected(config) -> bool:
     return (gateway_mod.get_env_value("WHATSAPP_ENABLED") or "").strip().lower() in {"true", "1", "yes"}
 
 
-def _build_adapter(config):
-    return WhatsAppAdapter(config)
-
 
 def register(ctx) -> None:
     ctx.register_platform(
-        name="whatsapp", label="WhatsApp", adapter_factory=_build_adapter, check_fn=check_whatsapp_requirements,
+        name="whatsapp", label="WhatsApp", adapter_factory=WhatsAppAdapter, check_fn=check_whatsapp_requirements,
         is_connected=_is_connected, required_env=["WHATSAPP_ENABLED"],
         install_hint="WhatsApp requires a Node.js bridge — see the WhatsApp messaging docs",
         setup_fn=interactive_setup, apply_yaml_config_fn=_apply_yaml_config, allowed_users_env="WHATSAPP_ALLOWED_USERS",
