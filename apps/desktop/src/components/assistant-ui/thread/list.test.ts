@@ -102,6 +102,12 @@ describe('transcriptPaneBudget', () => {
     expect(transcriptPaneBudget(4, true)).toBe(HIDDEN_TRANSCRIPT_RENDER_BUDGET)
     expect(transcriptPaneBudget(1, false)).toBeGreaterThan(HIDDEN_TRANSCRIPT_RENDER_BUDGET)
   })
+
+  it('keeps sharing one page budget past four mounted panes (no quarter floor)', () => {
+    const page = transcriptPaneBudget(1, false)
+    expect(transcriptPaneBudget(5, false)).toBeLessThan(transcriptPaneBudget(4, false))
+    expect(transcriptPaneBudget(6, false)).toBe(Math.ceil(page / 6))
+  })
 })
 
 describe('shouldClampTranscriptBudget', () => {
@@ -263,6 +269,21 @@ describe('firstVisibleGroupIndex', () => {
     const groups = Array.from({ length: 20 }, (_, i) => group(`g${i}`, 1))
 
     expect(firstVisibleGroupIndex(groups, 600, 8)).toBe(0)
+  })
+
+  it('keeps the cut stable while the unbudgeted streaming tail grows', () => {
+    const history = [group('old', 50), group('mid', 30), group('recent', 30)]
+    const initial = [...history, group('streaming', 1)]
+    const grown = [...history, group('streaming', 5_000)]
+
+    expect(firstVisibleGroupIndex(initial, 60, 0, true)).toBe(1)
+    expect(firstVisibleGroupIndex(grown, 60, 0, true)).toBe(1)
+  })
+
+  it('exempts exactly one newest group while older history stays budgeted', () => {
+    const groups = [group('a', 200), group('b', 50), group('c', 50), group('d', 50), group('e', 10_000)]
+
+    expect(firstVisibleGroupIndex(groups, 60, 0, true)).toBe(2)
   })
 })
 
