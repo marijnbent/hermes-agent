@@ -61,6 +61,7 @@ import {
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
 } from './bridge_helpers.js';
+import { ChatInventory } from './chat_inventory.js';
 
 // Parse CLI args
 const args = process.argv.slice(2);
@@ -100,6 +101,8 @@ const SEND_READ_RECEIPTS =
 
 const PORT = parseInt(getArg('port', '3000'), 10);
 const SESSION_DIR = getArg('session', path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'session'));
+const chatInventory = new ChatInventory({ filePath: path.join(SESSION_DIR, 'chats.json') });
+const pendingChatUpdates = new Map();
 // Cache directories: the Python gateway passes the profile-aware paths via
 // env (HERMES_HOME-aware, new cache/ layout).  Fall back to the legacy
 // hardcoded locations for bridges launched outside the gateway.
@@ -433,6 +436,33 @@ async function startSocket() {
     { logger, reuploadRequest: sock.updateMediaMessage },
   );
 
+  const observeChatUpdates = (chats) => {
+    chatInventory.updateChats(chats);
+    for (const chat of chats || []) {
+      const waiters = pendingChatUpdates.get(chat.id) || [];
+      for (const waiter of waiters) {
+        if (Object.hasOwn(chat, 'archived') && chat.archived === waiter.archived) {
+          clearTimeout(waiter.timer); waiter.done = true; waiter.resolve(chat);
+        }
+      }
+      pendingChatUpdates.set(chat.id, waiters.filter(waiter => !waiter.done));
+    }
+  };
+  sock.ev.on('contacts.upsert', (contacts) => chatInventory.updateContacts(contacts));
+  sock.ev.on('contacts.update', (contacts) => chatInventory.updateContacts(contacts));
+  sock.ev.on('chats.upsert', observeChatUpdates);
+  sock.ev.on('chats.update', observeChatUpdates);
+  sock.ev.on('chats.delete', (ids) => chatInventory.deleteChats((ids || []).map(id => ({ id }))));
+  sock.ev.on('messages.upsert', ({ messages }) => {
+    for (const message of messages || []) chatInventory.applyLiveMessage(message);
+  });
+  sock.ev.on('messaging-history.set', ({ chats, contacts, messages }) => {
+    chatInventory.applyHistory({ chats, contacts, messages });
+  });
+  sock.resyncAppState(['regular', 'regular_high', 'regular_low'], false).catch((err) => {
+    console.warn('[bridge] chat inventory app-state resync failed:', err.message);
+  });
+
   if (inboxArchive) {
     sock.ev.on('contacts.upsert', (contacts) => {
       for (const contact of contacts || []) {
@@ -459,6 +489,7 @@ async function startSocket() {
       }
     });
     sock.ev.on('messaging-history.set', async ({ chats, contacts, messages }) => {
+      chatInventory.applyHistory({ chats, contacts, messages });
       for (const chat of chats || []) {
         const name = chat.name || chat.displayName;
         if (chat.id && name) inboxChatNames.set(chat.id, name);
@@ -1191,6 +1222,31 @@ app.post('/read', async (req, res) => {
   } catch (err) {
     console.warn('[bridge] failed to send read receipt:', err.message);
     return res.status(500).json({ error: 'Failed to send read receipt' });
+  }
+});
+
+// Chat inventory
+app.get('/chats', (req, res) => res.json(chatInventory.list()));
+app.get('/chats/:id', (req, res) => {
+  const chat = chatInventory.get(req.params.id);
+  return chat ? res.json(chat) : res.status(404).json({ error: 'Unknown chat' });
+});
+app.post('/chats/:id/archive', async (req, res) => {
+  if (!sock || connectionState !== 'connected') return res.status(503).json({ error: 'Not connected' });
+  if (typeof req.body?.archived !== 'boolean') return res.status(400).json({ error: 'archived must be boolean' });
+  if (!chatInventory.canArchive(req.params.id, req.body.expectedLatestMessage)) return res.status(409).json({ error: 'stale or unknown latest message' });
+  const archived = req.body.archived;
+  const wait = new Promise((resolve, reject) => {
+    const waiter = { archived, resolve, reject, done: false };
+    waiter.timer = setTimeout(() => { waiter.done = true; reject(new Error('Timed out waiting for authoritative chat update')); }, 10000);
+    const waiters = pendingChatUpdates.get(req.params.id) || [];
+    waiters.push(waiter); pendingChatUpdates.set(req.params.id, waiters);
+  });
+  try {
+    await sock.chatModify({ archive: archived }, req.params.id);
+    return res.json(await wait);
+  } catch (err) {
+    return res.status(502).json({ error: err.message });
   }
 });
 
