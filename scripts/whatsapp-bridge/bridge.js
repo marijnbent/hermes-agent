@@ -1260,6 +1260,8 @@ app.post('/chats/:id/archive', async (req, res) => {
     const waiters = pendingChatUpdates.get(req.params.id) || [];
     waiters.push(waiter); pendingChatUpdates.set(req.params.id, waiters);
   });
+  // Observe early timeout rejection while chatModify is awaiting network ACK.
+  wait.catch(() => {});
   try {
     await sock.chatModify({
       archive: archived,
@@ -1276,6 +1278,8 @@ app.post('/chats/:id/archive', async (req, res) => {
     const confirmed = await wait;
     return res.json({ confirmed: true, source: 'chats.update', chat: confirmed });
   } catch (err) {
+    clearTimeout(pendingWaiter.timer);
+    pendingWaiter.done = true;
     const waiters = pendingChatUpdates.get(req.params.id) || [];
     pendingChatUpdates.set(req.params.id, waiters.filter((item) => item !== pendingWaiter && !item.done));
     return res.status(err.message.startsWith('Timed out') ? 504 : 502).json({ confirmed: false, error: err.message });

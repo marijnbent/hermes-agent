@@ -97,7 +97,10 @@ export class ChatInventory {
     if (!item) return;
     const prior = this.chats.get(item.chatId) || { id: item.chatId };
     const old = prior.latestMessage;
-    if (!old || item.timestamp >= old.timestamp) this.chats.set(item.chatId, { ...prior, latestMessage: { id: item.id, timestamp: item.timestamp } });
+    if (!old || item.timestamp >= old.timestamp) {
+      const { chatId, ...latestMessage } = item;
+      this.chats.set(item.chatId, { ...prior, latestMessage });
+    }
     if (live) this.coverage.live = true;
     this.save();
   }

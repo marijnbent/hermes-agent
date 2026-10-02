@@ -44,6 +44,13 @@ test('journal seeding keeps anchors and sender provenance without inventing chat
   assert.equal(inventory.coverage.journalAnchors, true);
 });
 
+test('live anchors preserve outgoing and group sender provenance', () => {
+  const inventory = new ChatInventory({ filePath: path.join(mkdtempSync(path.join(tmpdir(), 'wa-inventory-')), 'chats.json') });
+  inventory.applyLiveMessage({ key: { remoteJid: 'group@g.us', id: 'live1', fromMe: true, participant: 'self@lid' }, messageTimestamp: 50 });
+  assert.equal(inventory.get('group@g.us').latestMessage.fromMe, true);
+  assert.equal(inventory.get('group@g.us').latestMessage.participant, 'self@lid');
+});
+
 test('waits for authoritative chat update instead of reporting optimistic success', async () => {
   const events = [];
   const promise = waitForChatUpdate(events, 'a@s.whatsapp.net', true, 100);
