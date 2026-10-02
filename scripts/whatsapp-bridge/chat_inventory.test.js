@@ -33,6 +33,17 @@ test('unknown archive state stays unknown and stale guard rejects changed latest
   assert.equal(inventory.canArchive('b@g.us', { id: 'm1', timestamp: 2 }), true);
 });
 
+test('journal seeding keeps anchors and sender provenance without inventing chat state', () => {
+  const inventory = new ChatInventory({ filePath: path.join(mkdtempSync(path.join(tmpdir(), 'wa-inventory-')), 'chats.json') });
+  inventory.seedJournal([
+    { chatId: 'c@g.us', messageId: 'm1', timestamp: 4, direction: 'incoming', senderId: 'p@lid' },
+    { chatId: 'c@g.us', messageId: 'm2', timestamp: 5, direction: 'outgoing' },
+  ]);
+  assert.equal(inventory.get('c@g.us').archived, undefined);
+  assert.deepEqual(inventory.get('c@g.us').latestMessage, { chatId: 'c@g.us', id: 'm2', timestamp: 5, fromMe: true });
+  assert.equal(inventory.coverage.journalAnchors, true);
+});
+
 test('waits for authoritative chat update instead of reporting optimistic success', async () => {
   const events = [];
   const promise = waitForChatUpdate(events, 'a@s.whatsapp.net', true, 100);

@@ -103,6 +103,17 @@ const PORT = parseInt(getArg('port', '3000'), 10);
 const SESSION_DIR = getArg('session', path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'session'));
 const chatInventory = new ChatInventory({ filePath: path.join(SESSION_DIR, 'chats.json') });
 const pendingChatUpdates = new Map();
+const journalPath = path.join(SESSION_DIR, '..', 'inbox', 'messages.jsonl');
+try {
+  if (existsSync(journalPath)) {
+    const records = readFileSync(journalPath, 'utf8').split('\n').filter(Boolean).map((line) => {
+      try { return JSON.parse(line); } catch { return null; }
+    });
+    chatInventory.seedJournal(records);
+  }
+} catch (err) {
+  console.warn('[bridge] chat inventory journal seed failed:', err.message);
+}
 // Cache directories: the Python gateway passes the profile-aware paths via
 // env (HERMES_HOME-aware, new cache/ layout).  Fall back to the legacy
 // hardcoded locations for bridges launched outside the gateway.
@@ -459,9 +470,7 @@ async function startSocket() {
   sock.ev.on('messaging-history.set', ({ chats, contacts, messages }) => {
     chatInventory.applyHistory({ chats, contacts, messages });
   });
-  sock.resyncAppState(['regular', 'regular_high', 'regular_low'], false).catch((err) => {
-    console.warn('[bridge] chat inventory app-state resync failed:', err.message);
-  });
+  // App-state replay requires an open socket; do not trigger it during setup.
 
   if (inboxArchive) {
     sock.ev.on('contacts.upsert', (contacts) => {
@@ -489,7 +498,6 @@ async function startSocket() {
       }
     });
     sock.ev.on('messaging-history.set', async ({ chats, contacts, messages }) => {
-      chatInventory.applyHistory({ chats, contacts, messages });
       for (const chat of chats || []) {
         const name = chat.name || chat.displayName;
         if (chat.id && name) inboxChatNames.set(chat.id, name);
@@ -507,6 +515,7 @@ async function startSocket() {
     });
   }
 
+  let appStateReplayStarted = false;
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
 
@@ -546,6 +555,11 @@ async function startSocket() {
     } else if (connection === 'open') {
       if (PAIR_ONLY) removePairingQr(SESSION_DIR);
       connectionState = 'connected';
+      if (!appStateReplayStarted) {
+        appStateReplayStarted = true;
+        Promise.resolve().then(() => sock.resyncAppState(['regular', 'regular_high', 'regular_low'], false))
+          .catch((err) => console.warn('[bridge] chat inventory app-state resync failed:', err.message));
+      }
       const connectedUser = sock?.user
         ? {
             id: sock.user.id || null,
@@ -1234,19 +1248,37 @@ app.get('/chats/:id', (req, res) => {
 app.post('/chats/:id/archive', async (req, res) => {
   if (!sock || connectionState !== 'connected') return res.status(503).json({ error: 'Not connected' });
   if (typeof req.body?.archived !== 'boolean') return res.status(400).json({ error: 'archived must be boolean' });
-  if (!chatInventory.canArchive(req.params.id, req.body.expectedLatestMessage)) return res.status(409).json({ error: 'stale or unknown latest message' });
+  const expected = req.body.expectedLatestMessage;
+  if (!chatInventory.canArchive(req.params.id, expected)) return res.status(409).json({ error: 'stale or unknown latest message' });
+  const chat = chatInventory.get(req.params.id);
   const archived = req.body.archived;
+  let pendingWaiter;
   const wait = new Promise((resolve, reject) => {
     const waiter = { archived, resolve, reject, done: false };
+    pendingWaiter = waiter;
     waiter.timer = setTimeout(() => { waiter.done = true; reject(new Error('Timed out waiting for authoritative chat update')); }, 10000);
     const waiters = pendingChatUpdates.get(req.params.id) || [];
     waiters.push(waiter); pendingChatUpdates.set(req.params.id, waiters);
   });
   try {
-    await sock.chatModify({ archive: archived }, req.params.id);
-    return res.json(await wait);
+    await sock.chatModify({
+      archive: archived,
+      lastMessages: [{
+        key: {
+          remoteJid: req.params.id,
+          id: chat.latestMessage.id,
+          ...(chat.latestMessage.fromMe === true ? { fromMe: true } : {}),
+          ...(chat.latestMessage.participant ? { participant: chat.latestMessage.participant } : {}),
+        },
+        messageTimestamp: chat.latestMessage.timestamp,
+      }],
+    }, req.params.id);
+    const confirmed = await wait;
+    return res.json({ confirmed: true, source: 'chats.update', chat: confirmed });
   } catch (err) {
-    return res.status(502).json({ error: err.message });
+    const waiters = pendingChatUpdates.get(req.params.id) || [];
+    pendingChatUpdates.set(req.params.id, waiters.filter((item) => item !== pendingWaiter && !item.done));
+    return res.status(err.message.startsWith('Timed out') ? 504 : 502).json({ confirmed: false, error: err.message });
   }
 });
 

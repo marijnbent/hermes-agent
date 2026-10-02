@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
 
 function seconds(value) {
   if (value && typeof value.toNumber === 'function') return value.toNumber();
@@ -9,7 +10,11 @@ function seconds(value) {
 function anchor(message) {
   const id = message?.key?.id;
   const chatId = message?.key?.remoteJid;
-  return id && chatId ? { chatId, id, timestamp: seconds(message.messageTimestamp) } : null;
+  return id && chatId ? {
+    chatId, id, timestamp: seconds(message.messageTimestamp),
+    ...(message.key.fromMe === true ? { fromMe: true } : {}),
+    ...(message.key.participant ? { participant: message.key.participant } : {}),
+  } : null;
 }
 
 export class ChatInventory {
@@ -32,7 +37,7 @@ export class ChatInventory {
   }
 
   save() {
-    mkdirSync(new URL('.', `file://${this.filePath}`).pathname, { recursive: true });
+    mkdirSync(path.dirname(this.filePath), { recursive: true });
     writeFileSync(this.filePath, JSON.stringify({ coverage: this.coverage, chats: [...this.chats.values()], contacts: [...this.contacts.values()] }) + '\n', { mode: 0o600 });
   }
 
@@ -62,6 +67,26 @@ export class ChatInventory {
     this.updateContacts(contacts);
     for (const message of messages) this.applyMessage(message, false);
     this.coverage.history = true;
+    this.save();
+  }
+
+  // Journal records are message anchors only; they do not imply existence,
+  // completeness, or archived state.
+  seedJournal(records = []) {
+    for (const record of records) {
+      if (!record?.chatId || !record?.messageId) continue;
+      const item = {
+        chatId: record.chatId, id: record.messageId,
+        timestamp: seconds(record.timestamp),
+        ...(record.direction === 'outgoing' ? { fromMe: true } : {}),
+        ...(record.senderId ? { participant: record.senderId } : {}),
+      };
+      const prior = this.chats.get(item.chatId) || { id: item.chatId };
+      if (!prior.latestMessage || item.timestamp >= prior.latestMessage.timestamp) {
+        this.chats.set(item.chatId, { ...prior, latestMessage: item });
+      }
+    }
+    this.coverage.journalAnchors = true;
     this.save();
   }
 
