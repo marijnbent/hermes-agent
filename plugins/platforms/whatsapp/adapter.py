@@ -304,6 +304,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         rr = extra.get("send_read_receipts", False)
         self._send_read_receipts = rr if isinstance(rr, bool) else str(rr or "").strip().lower() in {"1", "true", "yes", "on"}
         self._inbox_capture_enabled = str(_extra_or_secret(extra, "inbox_capture_enabled", "WHATSAPP_INBOX_CAPTURE_ENABLED", "false")).strip().lower() in {"1", "true", "yes", "on"}
+        # Status publishing is profile config, not a secret.  Do not let the launch
+        # profile's process environment enable it for an unrelated profile.
+        status_publishing = extra.get("status_publishing_enabled", False)
+        self._status_publishing_enabled = status_publishing if isinstance(status_publishing, bool) else str(status_publishing).strip().lower() in {"1", "true", "yes", "on"}
         self._inbox_capture_since = str(_extra_or_secret(extra, "inbox_capture_since", "WHATSAPP_INBOX_CAPTURE_SINCE", "1970-01-01T00:00:00Z"))
         self._mention_patterns = self._compile_mention_patterns()
         self._message_queue: asyncio.Queue = asyncio.Queue()
@@ -394,6 +398,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 and bool(data.get("inboxCaptureEnabled", False)) == getattr(self, "_inbox_capture_enabled", False)
                 and str(data.get("inboxCaptureSince") or "") == getattr(self, "_inbox_capture_since", "1970-01-01T00:00:00Z")
                 and str(data.get("inboxCaptureDir") or "") == str(self._session_path.parent / "inbox")
+                # Older bridges omit this field; only compare it when present so they
+                # remain reusable.  A reported value must match this profile's config.
+                and ("statusPublishingEnabled" not in data or bool(data["statusPublishingEnabled"]) == getattr(self, "_status_publishing_enabled", False))
             )
             if running_hash and disk_hash and running_hash == disk_hash and config_matches:
                 print(f"[{self.name}] Using existing bridge (status: {bridge_status})")
@@ -422,6 +429,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             bridge_env.pop("WHATSAPP_REPLY_PREFIX", None)
         bridge_env["WHATSAPP_SEND_READ_RECEIPTS"] = "true" if self._send_read_receipts else "false"
         bridge_env["WHATSAPP_INBOX_CAPTURE_ENABLED"] = "true" if getattr(self, "_inbox_capture_enabled", False) else "false"
+        bridge_env["WHATSAPP_STATUS_PUBLISHING_ENABLED"] = "true" if getattr(self, "_status_publishing_enabled", False) else "false"
         bridge_env["WHATSAPP_INBOX_CAPTURE_SINCE"] = getattr(self, "_inbox_capture_since", "1970-01-01T00:00:00Z")
         bridge_env["WHATSAPP_INBOX_CAPTURE_DIR"] = str(self._session_path.parent / "inbox")
         for _key, _v in [("WHATSAPP_MODE", _wenv("WHATSAPP_MODE", "self-chat"))] + [(k, _wenv(k)) for k in _BRIDGE_PASSTHROUGH_ENV]:
@@ -1051,6 +1059,7 @@ _YAML_BRIDGE = (  # (yaml key, env var, kind) for apply_yaml_bridge
     ("group_policy", "WHATSAPP_GROUP_POLICY", "lower"), ("mention_patterns", "WHATSAPP_MENTION_PATTERNS", "json"),
     ("free_response_chats", "WHATSAPP_FREE_RESPONSE_CHATS", "csv"), ("allow_from", "WHATSAPP_ALLOWED_USERS", "csv"),
     ("group_allow_from", "WHATSAPP_GROUP_ALLOWED_USERS", "csv"),
+    ("status_publishing_enabled", "WHATSAPP_STATUS_PUBLISHING_ENABLED", "lower"),
 )
 
 

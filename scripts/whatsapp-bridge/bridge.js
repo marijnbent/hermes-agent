@@ -62,6 +62,7 @@ import {
   pollUpdateForAggregation,
 } from './bridge_helpers.js';
 import { ChatInventory } from './chat_inventory.js';
+import { createStatusRouter } from './status.js';
 
 // Parse CLI args
 const args = process.argv.slice(2);
@@ -167,6 +168,7 @@ const CHUNK_DELAY_MS = parseInt(process.env.WHATSAPP_CHUNK_DELAY_MS || '300', 10
 // which pins the bridge's HTTP handler until the upstream aiohttp timeout
 // fires. Fail fast instead so the gateway can surface a real error and retry.
 const SEND_TIMEOUT_MS = parseInt(process.env.WHATSAPP_SEND_TIMEOUT_MS || '60000', 10);
+const STATUS_PUBLISHING_ENABLED = ['1', 'true', 'yes', 'on'].includes(String(process.env.WHATSAPP_STATUS_PUBLISHING_ENABLED || '').toLowerCase());
 
 // --- Send queue: serialise all sock.sendMessage() calls across concurrent
 //     HTTP handlers so a single Baileys socket never has overlapping sends.
@@ -952,6 +954,14 @@ app.use((req, res, next) => {
   next();
 });
 
+// Status is deliberately separate from /send and remains behind host validation.
+app.use('/status', createStatusRouter({
+  isEnabled: () => STATUS_PUBLISHING_ENABLED,
+  isConnected: () => Boolean(sock && connectionState === 'connected'),
+  sendStatus: (jid, payload, options) => sendWithTimeout(jid, payload, options),
+  journalPath: path.join(SESSION_DIR, '..', 'status', 'journal.jsonl'),
+}));
+
 // Poll for new messages (long-poll style)
 app.get('/messages', (req, res) => {
   const msgs = messageQueue.splice(0, messageQueue.length);
@@ -1319,6 +1329,7 @@ app.get('/health', (req, res) => {
     uptime: process.uptime(),
     scriptHash: SCRIPT_HASH,
     sendReadReceipts: SEND_READ_RECEIPTS,
+    statusPublishingEnabled: STATUS_PUBLISHING_ENABLED,
     inboxCaptureEnabled: INBOX_CAPTURE_ENABLED,
     inboxCaptureSince: INBOX_CAPTURE_SINCE,
     inboxCaptureDir: INBOX_CAPTURE_DIR,
