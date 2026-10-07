@@ -19,6 +19,6 @@ node whatsapp-status.mjs --bridge http://127.0.0.1:3001 \
   --audience 31612345678@s.whatsapp.net --text 'hello' --key run-2026-10-06-01
 ```
 
-The client validates locally and accepts only `http://127.0.0.1:3001`, Molletje's bot bridge. The journal retains up to 1024 keys without eviction; at capacity, new publications fail closed with 507 until explicit maintenance. Never clear keys for a Status that could still be retried.
+The journal retains all records except successful rotation records whose keys start with `molletje-status-rotation-` and whose `publishedAt` is more than 7 days old. Pruning happens only when accepting a new request and compacts the journal atomically; pending, uncertain, failed, legacy records without a timestamp, and unrelated keys are never pruned. This permits indefinite daily rotation while preserving fail-closed behavior if no safe record can be removed. Legitimate reuse of an expired rotation key may be treated as a new publication after retention expiry. Health exposes `statusRotationRetentionDays: 7`. Never clear keys for a Status that could still be retried.
 
 After enabling the configuration, an external-shell gateway reload is required. Do not restart the owning gateway from its own assistant turn. Verify `/health` reports `statusPublishingEnabled: true` on port 3001 and disabled/absent on personal port 3000 before publishing. A limited-audience live test and phone visibility check are separate acceptance steps.

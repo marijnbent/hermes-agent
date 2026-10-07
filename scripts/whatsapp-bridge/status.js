@@ -7,6 +7,9 @@ const MAX_TEXT_LENGTH = 4096;
 const JID = /^\d{5,20}@s\.whatsapp\.net$/;
 const HEX = /^#[0-9a-fA-F]{6}$/;
 const MAX_RECORDS = 1024;
+const ROTATION_PREFIX = 'molletje-status-rotation-';
+const ROTATION_RETENTION_DAYS = 7;
+const DAY_MS = 24 * 60 * 60 * 1000;
 const uncertainMessage = 'Provider outcome is uncertain; use a new idempotency key only for an intentional override';
 
 export function validateStatusRequest(body = {}) {
@@ -26,7 +29,7 @@ export function validateStatusRequest(body = {}) {
 function digest(request) { return createHash('sha256').update(JSON.stringify({ text: request.text, audience: request.audience, style: request.style })).digest('hex'); }
 function atomicAppend(file, record) { appendFileSync(file, `${JSON.stringify(record)}\n`, { mode: 0o600 }); }
 
-export function createStatusRouter({ isEnabled = () => false, isConnected, sendStatus, journalPath } = {}) {
+export function createStatusRouter({ isEnabled = () => false, isConnected, sendStatus, journalPath, clock = Date.now } = {}) {
   const records = new Map();
   const inFlight = new Map();
   if (journalPath) {
@@ -44,6 +47,23 @@ export function createStatusRouter({ isEnabled = () => false, isConnected, sendS
       }
     }
   }
+  const compactExpiredRotationRecords = () => {
+    const cutoff = clock() - ROTATION_RETENTION_DAYS * DAY_MS;
+    let pruned = false;
+    for (const [key, record] of records) {
+      if (key.startsWith(ROTATION_PREFIX) && record.outcome === 'published' && Number.isFinite(record.publishedAt) && record.publishedAt < cutoff) {
+        records.delete(key);
+        pruned = true;
+      }
+    }
+    if (pruned && journalPath) {
+      const tmp = `${journalPath}.tmp`;
+      writeFileSync(tmp, `${[...records.values()].map((item) => JSON.stringify(item)).join('\n')}\n`, { mode: 0o600 });
+      renameSync(tmp, journalPath);
+    }
+    return pruned;
+  };
+  compactExpiredRotationRecords();
   if (records.size > MAX_RECORDS) throw new Error('Status journal exceeds safe capacity');
   const persist = (record) => {
     if (!journalPath) return;
@@ -69,9 +89,9 @@ export function createStatusRouter({ isEnabled = () => false, isConnected, sendS
       return { status: 504, body: prior };
     }
     if (prior && ['published', 'failed', 'uncertain'].includes(prior.outcome)) return { status: prior.outcome === 'published' ? 200 : (prior.outcome === 'uncertain' ? 504 : 502), body: { ...prior, deduplicated: true } };
-    if (records.size >= MAX_RECORDS) return { status: 507, body: { error: 'Status journal is full; explicit maintenance required, no keys evicted' } };
+    if (records.size >= MAX_RECORDS && (!compactExpiredRotationRecords() || records.size >= MAX_RECORDS)) return { status: 507, body: { error: 'Status journal is full; explicit maintenance required, no keys evicted' } };
     if (!isConnected()) return { status: 503, body: { error: 'Not connected to WhatsApp' } };
-    const pending = { key, digest: dg, outcome: 'pending' };
+    const pending = { key, digest: dg, outcome: 'pending', createdAt: clock() };
     records.set(key, pending);
     persist(pending);
     const work = (async () => {
@@ -79,7 +99,7 @@ export function createStatusRouter({ isEnabled = () => false, isConnected, sendS
         const sent = await sendStatus('status@broadcast', { text: request.text }, { statusJidList: request.audience, ...request.style });
         const messageId = sent?.key?.id;
         if (!messageId) throw new Error('Provider returned no status message id');
-        const record = { key, digest: dg, outcome: 'published', messageId, audience: request.audience, textLength: request.text.length };
+        const record = { key, digest: dg, outcome: 'published', messageId, audience: request.audience, textLength: request.text.length, publishedAt: clock() };
         records.set(key, record); persist(record); return { status: 200, body: record };
       } catch (error) {
         const uncertain = /timed out|timeout|network|disconnect|socket|no status message id/i.test(String(error?.message));
@@ -107,5 +127,6 @@ export function createStatusRouter({ isEnabled = () => false, isConnected, sendS
   router.publish = handle;
   router.records = records;
   router.getStatus = (key) => isEnabled() && records.has(key) ? { status: 200, body: records.get(key) } : { status: 404 };
+  router.rotationRetentionDays = ROTATION_RETENTION_DAYS;
   return router;
 }

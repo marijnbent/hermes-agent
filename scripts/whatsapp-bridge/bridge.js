@@ -961,12 +961,13 @@ app.use((req, res, next) => {
 });
 
 // Status is deliberately separate from /send and remains behind host validation.
-app.use('/status', createStatusRouter({
+const statusRouter = createStatusRouter({
   isEnabled: () => STATUS_PUBLISHING_ENABLED,
   isConnected: () => Boolean(sock && connectionState === 'connected'),
   sendStatus: (jid, payload, options) => sendWithTimeout(jid, payload, options),
   journalPath: path.join(SESSION_DIR, '..', 'status', 'journal.jsonl'),
-}));
+});
+app.use('/status', statusRouter);
 
 // Poll for new messages (long-poll style)
 app.get('/messages', (req, res) => {
@@ -1336,6 +1337,7 @@ app.get('/health', (req, res) => {
     scriptHash: SCRIPT_HASH,
     sendReadReceipts: SEND_READ_RECEIPTS,
     statusPublishingEnabled: STATUS_PUBLISHING_ENABLED,
+    statusRotationRetentionDays: statusRouter.rotationRetentionDays,
     inboxCaptureEnabled: INBOX_CAPTURE_ENABLED,
     inboxCaptureSince: INBOX_CAPTURE_SINCE,
     inboxCaptureDir: INBOX_CAPTURE_DIR,

@@ -97,6 +97,37 @@ test('bounds in-memory records without allowing a recent status to resend', asyn
   assert.ok(router.records.size <= 1024);
 });
 
+test('prunes only expired successful rotation records before capacity refusal', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'status-'));
+  const journalPath = path.join(dir, 'journal.jsonl');
+  const now = 10 * 24 * 60 * 60 * 1000;
+  const old = now - 8 * 24 * 60 * 60 * 1000;
+  const recent = now - 6 * 24 * 60 * 60 * 1000;
+  const records = Array.from({ length: 1023 }, (_, i) => ({ key: i === 0 ? 'molletje-status-rotation-old' : i === 1 ? 'molletje-status-rotation-recent' : `general-${i}`, digest: `d-${i}`, outcome: 'published', publishedAt: i === 0 ? old : i === 1 ? recent : now }));
+  records.push({ key: 'molletje-status-rotation-uncertain', digest: 'du', outcome: 'uncertain', publishedAt: old });
+  writeFileSync(journalPath, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+  const router = createStatusRouter({ journalPath, clock: () => now, isEnabled: () => true, isConnected: () => true, sendStatus: async () => ({ key: { id: 'new' } }) });
+  const response = await router.publish({ text: 'new', audience: ['31612345678@s.whatsapp.net'], idempotencyKey: 'molletje-status-rotation-new' });
+  assert.equal(response.status, 200);
+  assert.equal(router.records.has('molletje-status-rotation-old'), false);
+  assert.equal(router.records.has('molletje-status-rotation-recent'), true);
+  assert.equal(router.records.has('molletje-status-rotation-uncertain'), true);
+  assert.equal(router.records.has('general-2'), true);
+  const restarted = createStatusRouter({ journalPath, clock: () => now, isEnabled: () => true });
+  assert.equal(restarted.records.has('molletje-status-rotation-old'), false);
+  assert.equal(restarted.records.has('molletje-status-rotation-recent'), true);
+  assert.equal(restarted.records.has('molletje-status-rotation-uncertain'), true);
+});
+
+test('retains safe records and fails closed when no safe rotation record can be pruned', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'status-'));
+  const journalPath = path.join(dir, 'journal.jsonl');
+  writeFileSync(journalPath, Array.from({ length: 1024 }, (_, i) => JSON.stringify({ key: `general-${i}`, outcome: 'published', publishedAt: 1 })).join('\n') + '\n');
+  const router = createStatusRouter({ journalPath, clock: () => 10 * 24 * 60 * 60 * 1000, isEnabled: () => true, isConnected: () => true, sendStatus: async () => ({ key: { id: 'nope' } }) });
+  const response = await router.publish({ text: 'new', audience: ['31612345678@s.whatsapp.net'], idempotencyKey: 'molletje-status-rotation-new' });
+  assert.equal(response.status, 507);
+});
+
 test('GET is disabled when status publishing is disabled', async () => {
   const router = createStatusRouter({ isEnabled: () => false });
   router.records.set('secret', { key: 'secret', outcome: 'published' });
